@@ -1,4 +1,10 @@
-import { fetchJson, ProviderFetchError } from "@/lib/http/client";
+import { unstable_cache } from "next/cache";
+
+import {
+  describeError,
+  fetchJson,
+  ProviderFetchError,
+} from "@/lib/http/client";
 import type { AnimeStreamingEpisode } from "@/types/anime";
 
 const ANIZIP_ENDPOINT = "https://api.ani.zip/mappings";
@@ -139,52 +145,108 @@ function toEpisodes(
     });
 }
 
+function toAniZipData(anilistId: number, data: AniZipResponse): AniZipData {
+  const episodes = toEpisodes(data.episodes || {});
+  const withThumbnail = episodes.filter((episode) => episode.thumbnail);
+
+  return {
+    mappings: toMappings(anilistId, data.mappings),
+    episodes,
+    episodeCount: toNumericId(data.episodeCount),
+    specialCount: toNumericId(data.specialCount),
+    images:
+      data.images?.flatMap((image) =>
+        image.url
+          ? [{ coverType: image.coverType || "Unknown", url: image.url }]
+          : [],
+      ) || [],
+    imageCoverage: episodes.length
+      ? withThumbnail.length / episodes.length
+      : 0,
+  };
+}
+
+/**
+ * Fetches and parses one ani.zip entry. Throws ProviderFetchError on any
+ * failure (including an empty or malformed body) so a failure is never
+ * stored in the data cache below.
+ */
+async function loadAniZipData(anilistId: number): Promise<AniZipData> {
+  const data = await fetchJson<AniZipResponse>(
+    `${ANIZIP_ENDPOINT}?anilist_id=${anilistId}`,
+    {
+      // Ignored inside unstable_cache (fetches there are never cached); only
+      // applies on the uncached fallback path in getAniZipData.
+      next: { revalidate: 86400 },
+    },
+    {
+      provider: "AniZip",
+      timeoutMs: 6_000,
+      retries: 1,
+      retryDelayMs: 500,
+      cacheKey: `anizip:${anilistId}`,
+      staleTtlMs: 86400 * 1000 * 7,
+    },
+  );
+
+  try {
+    if (!data || typeof data !== "object") {
+      throw new Error("empty response body");
+    }
+
+    return toAniZipData(anilistId, data);
+  } catch (error) {
+    throw new ProviderFetchError({
+      provider: "AniZip",
+      message: `AniZip response for ${anilistId} could not be parsed: ${describeError(error)}`,
+      cause: error,
+    });
+  }
+}
+
+// Long-running shows (One Piece, Conan) return 1.5-2.5MB of raw JSON, over
+// the 2MB per-entry limit of Next's fetch cache, so caching the raw fetch
+// silently failed and refetched on every request. The parsed result is less
+// than half the size, so cache that instead.
+const getCachedAniZipData = unstable_cache(loadAniZipData, ["anizip-data-v1"], {
+  revalidate: 86400,
+});
+
+async function getAniZipDataWithCacheFallback(
+  anilistId: number,
+): Promise<AniZipData> {
+  try {
+    return await getCachedAniZipData(anilistId);
+  } catch (error) {
+    if (error instanceof ProviderFetchError) {
+      throw error;
+    }
+
+    // Next's cache layer itself failed (not ani.zip) - the data matters more
+    // than caching it, so load it directly.
+    console.warn(
+      `AniZip data cache unavailable for ${anilistId}, loading uncached: ${describeError(error)}`,
+    );
+    return loadAniZipData(anilistId);
+  }
+}
+
 export async function getAniZipData(
   anilistId: number,
 ): Promise<AniZipData | null> {
+  if (!Number.isInteger(anilistId) || anilistId <= 0) {
+    return null;
+  }
+
   try {
-    const data = await fetchJson<AniZipResponse>(
-      `${ANIZIP_ENDPOINT}?anilist_id=${anilistId}`,
-      {
-        next: { revalidate: 86400 },
-      },
-      {
-        provider: "AniZip",
-        timeoutMs: 6_000,
-        retries: 1,
-        retryDelayMs: 500,
-        cacheKey: `anizip:${anilistId}`,
-        staleTtlMs: 86400 * 1000 * 7,
-      },
-    );
-
-    if (!data) return null;
-
-    const episodes = toEpisodes(data.episodes || {});
-    const withThumbnail = episodes.filter((episode) => episode.thumbnail);
-
-    return {
-      mappings: toMappings(anilistId, data.mappings),
-      episodes,
-      episodeCount: toNumericId(data.episodeCount),
-      specialCount: toNumericId(data.specialCount),
-      images:
-        data.images?.flatMap((image) =>
-          image.url
-            ? [{ coverType: image.coverType || "Unknown", url: image.url }]
-            : [],
-        ) || [],
-      imageCoverage: episodes.length
-        ? withThumbnail.length / episodes.length
-        : 0,
-    };
+    return await getAniZipDataWithCacheFallback(anilistId);
   } catch (error) {
     if (error instanceof ProviderFetchError && error.status === 404) {
       // ani.zip simply has no entry for this title - expected, not an error.
       return null;
     }
 
-    console.warn("AniZip fetch error:", error);
+    console.warn(`AniZip fetch failed for ${anilistId}: ${describeError(error)}`);
     return null;
   }
 }

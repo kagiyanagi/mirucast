@@ -1,4 +1,9 @@
-import { fetchJson } from "@/lib/http/client";
+import {
+  describeError,
+  fetchJson,
+  ProviderFetchError,
+  type ProviderBreakerOptions,
+} from "@/lib/http/client";
 import type {
   AnimeNewsArticle,
   EpisodeFlags,
@@ -10,6 +15,26 @@ import type {
 // Public rate limit is 60 requests/minute - long revalidation keeps us
 // far below it.
 const JIKAN_ENDPOINT = "https://api.jikan.moe/v4";
+
+// Jikan goes unresponsive for long stretches. Once it has failed a few times
+// in a row, stop making every page wait out the full timeout for optional
+// enrichment - see ProviderBreakerOptions.
+const JIKAN_BREAKER: ProviderBreakerOptions = {
+  threshold: 3,
+  cooldownMs: 120_000,
+  degradedTimeoutMs: 1_500,
+};
+
+function logJikanFailure(what: string, malId: number, error: unknown) {
+  // The outage itself is already logged once by the breaker.
+  if (error instanceof ProviderFetchError && error.duringOutage) {
+    return;
+  }
+
+  console.warn(
+    `Jikan ${what} fetch failed for MAL ${malId}: ${describeError(error)}`,
+  );
+}
 
 type JikanAnimeResponse = {
   data?: {
@@ -53,6 +78,7 @@ export async function getMalStats(malId: number): Promise<MalStats | null> {
         // a 429/down response.
         timeoutMs: 4_000,
         retries: 0,
+        breaker: JIKAN_BREAKER,
         retryDelayMs: 1_000,
         cacheKey: `jikan:anime:${malId}`,
         staleTtlMs: 21_600 * 1000 * 8,
@@ -79,7 +105,7 @@ export async function getMalStats(malId: number): Promise<MalStats | null> {
       url: payload.data.url || `https://myanimelist.net/anime/${malId}`,
     };
   } catch (error) {
-    console.warn(`Jikan stats fetch failed for MAL ${malId}`, error);
+    logJikanFailure("stats", malId, error);
     return null;
   }
 }
@@ -113,6 +139,7 @@ async function fetchEpisodePage(
       provider: "Jikan",
       timeoutMs: 6_000,
       retries: 1,
+      breaker: JIKAN_BREAKER,
       retryDelayMs: 1_000,
       cacheKey: `jikan:episodes:${malId}:${page}`,
       staleTtlMs: 86_400 * 1000 * 7,
@@ -175,7 +202,7 @@ export async function getJikanEpisodeFlags(
 
     return { filler, recap };
   } catch (error) {
-    console.warn(`Jikan episode flags fetch failed for MAL ${malId}`, error);
+    logJikanFailure("episode flags", malId, error);
     return null;
   }
 }
@@ -223,6 +250,7 @@ export async function getAnimeNews(
         // rather than burning a retry delay on a 429/down response.
         timeoutMs: 5_000,
         retries: 0,
+        breaker: JIKAN_BREAKER,
         retryDelayMs: 1_000,
         cacheKey: `jikan:news:${malId}`,
         staleTtlMs: 10_800 * 1000 * 8,
@@ -254,7 +282,7 @@ export async function getAnimeNews(
             : null,
       }));
   } catch (error) {
-    console.warn(`Jikan news fetch failed for MAL ${malId}`, error);
+    logJikanFailure("news", malId, error);
     return [];
   }
 }

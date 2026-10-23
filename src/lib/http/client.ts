@@ -19,6 +19,25 @@ type ProviderFetchOptions = {
   staleTtlMs?: number;
   staleOnNonRetryable?: boolean;
   dedupe?: boolean;
+  breaker?: ProviderBreakerOptions;
+};
+
+/**
+ * Per-provider circuit breaker for optional upstreams. After `threshold`
+ * consecutive retryable failures the provider is treated as degraded for
+ * `cooldownMs`: requests still go out (so Next data cache hits keep serving
+ * data) but with a short timeout and no retries, so an outage costs callers
+ * ~1s instead of the full timeout on every request.
+ */
+export type ProviderBreakerOptions = {
+  threshold: number;
+  cooldownMs: number;
+  degradedTimeoutMs: number;
+};
+
+type BreakerState = {
+  consecutiveFailures: number;
+  degradedUntil: number;
 };
 
 const DEFAULT_TIMEOUT_MS = 8_000;
@@ -26,12 +45,27 @@ const DEFAULT_RETRIES = 2;
 const DEFAULT_RETRY_DELAY_MS = 350;
 const staleCache = new Map<string, CacheEntry<unknown>>();
 const inFlightRequests = new Map<string, Promise<unknown>>();
+// Pages and route handlers are bundled separately and each gets its own copy
+// of this module, so breaker state lives on globalThis to be shared by the
+// whole server process.
+const breakersGlobal = globalThis as typeof globalThis & {
+  __providerBreakers?: Map<string, BreakerState>;
+};
+const breakers = (breakersGlobal.__providerBreakers ??= new Map<
+  string,
+  BreakerState
+>());
 
 export class ProviderFetchError extends Error {
   provider: string;
   status: number | null;
   retryable: boolean;
   retryAfterMs: number | null;
+  /**
+   * True when the provider was already known to be failing before this
+   * request (its breaker had tripped) - callers can skip logging it.
+   */
+  duringOutage: boolean;
 
   constructor(input: {
     provider: string;
@@ -40,6 +74,7 @@ export class ProviderFetchError extends Error {
     retryable?: boolean;
     retryAfterMs?: number | null;
     cause?: unknown;
+    duringOutage?: boolean;
   }) {
     super(input.message);
     this.name = "ProviderFetchError";
@@ -47,8 +82,76 @@ export class ProviderFetchError extends Error {
     this.status = input.status ?? null;
     this.retryable = Boolean(input.retryable);
     this.retryAfterMs = input.retryAfterMs ?? null;
+    this.duringOutage = Boolean(input.duringOutage);
     this.cause = input.cause;
   }
+}
+
+/**
+ * One-line description of a failure for logs. Logging the error object itself
+ * dumps the stack plus every DOMException constant for aborted requests.
+ */
+export function describeError(error: unknown): string {
+  const text =
+    error instanceof Error ? error.message || error.name : String(error);
+  // Some framework errors embed source code after the first line.
+  const firstLine = text.split("\n", 1)[0].trim();
+
+  return firstLine.length > 300 ? `${firstLine.slice(0, 300)}...` : firstLine;
+}
+
+function getBreaker(provider: string): BreakerState {
+  let state = breakers.get(provider);
+
+  if (!state) {
+    state = { consecutiveFailures: 0, degradedUntil: 0 };
+    breakers.set(provider, state);
+  }
+
+  return state;
+}
+
+function recordBreakerSuccess(provider: string) {
+  const state = getBreaker(provider);
+
+  // While degraded, a success is usually a Next data cache hit and says
+  // nothing about the upstream, so only a success after the cooldown counts
+  // as recovery.
+  if (state.degradedUntil > Date.now()) {
+    return;
+  }
+
+  state.consecutiveFailures = 0;
+  state.degradedUntil = 0;
+}
+
+/**
+ * Returns true when the provider had already tripped its breaker before this
+ * failure, i.e. this failure is part of a known outage.
+ */
+function recordBreakerFailure(
+  provider: string,
+  breaker: ProviderBreakerOptions,
+): boolean {
+  const state = getBreaker(provider);
+  const wasAlreadyFailing = state.consecutiveFailures >= breaker.threshold;
+  state.consecutiveFailures += 1;
+
+  if (state.consecutiveFailures < breaker.threshold) {
+    return false;
+  }
+
+  state.degradedUntil = Date.now() + breaker.cooldownMs;
+
+  if (!wasAlreadyFailing) {
+    console.warn(
+      `${provider} unresponsive after ${breaker.threshold} consecutive failures - ` +
+        `using ${breaker.degradedTimeoutMs}ms timeouts without retries; ` +
+        `further ${provider} failures are not logged until it recovers`,
+    );
+  }
+
+  return wasAlreadyFailing;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -118,7 +221,11 @@ function readStaleCache<T>(
     return null;
   }
 
-  console.warn(`Using stale provider cache for ${cacheKey}`, error);
+  if (!(error instanceof ProviderFetchError && error.duringOutage)) {
+    console.warn(
+      `Using stale provider cache for ${cacheKey}: ${describeError(error)}`,
+    );
+  }
   return entry.value as T;
 }
 
@@ -148,7 +255,11 @@ async function fetchJsonOnce<T>(
   >,
 ): Promise<T> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, options.timeoutMs);
 
   try {
     const response = await fetch(url, {
@@ -174,8 +285,9 @@ async function fetchJsonOnce<T>(
 
     throw new ProviderFetchError({
       provider: options.provider,
-      message:
-        error instanceof Error
+      message: timedOut
+        ? `${options.provider} request timed out after ${options.timeoutMs}ms`
+        : error instanceof Error
           ? `${options.provider} request failed: ${error.message}`
           : `${options.provider} request failed`,
       retryable: true,
@@ -191,10 +303,19 @@ async function fetchJsonWithRetry<T>(
   init: NextFetchInit,
   options: ProviderFetchOptions,
 ): Promise<T> {
+  const breaker = options.breaker;
+  const breakerState = breaker ? getBreaker(options.provider) : null;
+  const degraded = Boolean(
+    breaker && breakerState && breakerState.degradedUntil > Date.now(),
+  );
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const normalizedOptions = {
     provider: options.provider,
-    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    retries: options.retries ?? DEFAULT_RETRIES,
+    timeoutMs:
+      degraded && breaker
+        ? Math.min(timeoutMs, breaker.degradedTimeoutMs)
+        : timeoutMs,
+    retries: degraded ? 0 : (options.retries ?? DEFAULT_RETRIES),
     retryDelayMs: options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
   };
 
@@ -202,6 +323,9 @@ async function fetchJsonWithRetry<T>(
     try {
       const value = await fetchJsonOnce<T>(url, init, normalizedOptions);
       writeStaleCache(options.cacheKey, value, options.staleTtlMs);
+      if (breaker) {
+        recordBreakerSuccess(options.provider);
+      }
       return value;
     } catch (error) {
       const providerError =
@@ -216,6 +340,18 @@ async function fetchJsonWithRetry<T>(
       const attemptsRemaining = attempt < normalizedOptions.retries;
 
       if (!providerError.retryable || !attemptsRemaining) {
+        if (breaker) {
+          // A non-retryable answer (404 etc.) still proves the upstream is up.
+          if (providerError.retryable) {
+            providerError.duringOutage = recordBreakerFailure(
+              options.provider,
+              breaker,
+            );
+          } else {
+            recordBreakerSuccess(options.provider);
+          }
+        }
+
         const canUseStale =
           providerError.retryable || options.staleOnNonRetryable === true;
         const cached = canUseStale
